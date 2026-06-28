@@ -83,7 +83,7 @@ TOOL_METRIC_ALIASES = {
     "dmc_fe_request_stall": ["chi_request_zerocredits"],
     "dmc_fe_response_stall": ["chi_response_zerocredits"],
     "dmc_fe_write_request_util": ["chi_wr_percentage"],
-    "dmc_fe_write_retry_util": ["chi_wr_retry_percentage"],
+    "dmc_fe_write_retry_util": ["chi_retry_percentage"],
     "dmc_fe_writenosnp_pcmosep_rate": ["chi_writenosnp_pcmosep_percentage"],
     "dmc_fe_writenosnpfull_rate": ["chi_writenosnpfull_percentage"],
     "dmc_fe_writenosnpptl_rate": ["chi_writenosnpptl_percentage"],
@@ -108,12 +108,10 @@ EVENT_FORMULAS = {
         "unit": "%",
         "formula": "CHI_RSPOUT_TIMEOUT_CREDIT / CHI_CYCLES * 100",
     },
-    "dmc_fe_write_retry_util": {
-        "num": ["CHI_REQ_XMIT_WR_RETRIES"],
-        "den": CYCLES,
-        "unit": "%",
-        "formula": "CHI_REQ_XMIT_WR_RETRIES / CHI_CYCLES * 100",
-    },
+    # Use tool-derived chi_retry_percentage for this metric name.
+    # Do not derive from CHI_REQ_XMIT_WR_RETRIES because Phoenix topdown exports
+    # the expected ~40% retry value as chi_retry_percentage.
+
 }
 
 
@@ -122,6 +120,13 @@ CMD_TYPE_EVENTS = [
     "CHI_REQIF_OP_PREFETCHTGT",
     "CHI_REQIF_OP_READNOSNP",
     "CHI_REQIF_OP_READNOSNPSEP",
+    "CHI_REQIF_OP_WRITENOSNPFULL",
+    "CHI_REQIF_OP_WRITENOSNPFULL_PTL_PCMOSEP",
+    "CHI_REQIF_OP_WRITENOSNPPTL",
+    "CHI_REQIF_OP_WRITEZERO",
+]
+
+WRITE_REQUEST_EVENTS = [
     "CHI_REQIF_OP_WRITENOSNPFULL",
     "CHI_REQIF_OP_WRITENOSNPFULL_PTL_PCMOSEP",
     "CHI_REQIF_OP_WRITENOSNPPTL",
@@ -142,7 +147,7 @@ def safe_float(x) -> Optional[float]:
         if x is None:
             return None
         s = str(x).strip()
-        if not s or s.lower() in {"nan", "nan.0", "<not counted>", "<not supported>"}:
+        if not s or s.lower() in {"nan", "nan.0", "nan.000000", "<not counted>", "<not supported>"}:
             return None
         v = float(s)
         if math.isnan(v):
@@ -160,29 +165,32 @@ def device_index(dev: str) -> Optional[int]:
 def selected_devices(all_devices: List[str], chip: str) -> List[str]:
     """Return frontend/backend device labels selected by chip.
 
-    chip=0 keeps the lower half of DMC IDs.
-    chip=1 keeps the upper half of DMC IDs.
-    chip=both keeps all DMC IDs.
+    Phoenix DMC frontend IDs are sparse:
+      chip 0: frontend0..frontend11
+      chip 1: frontend24..frontend35
+
+    topdown CSVs may include NaN columns for the other chip, so do not split by
+    midpoint of min/max device IDs.
     """
     chip = str(chip).lower()
     devs = sorted(set(all_devices), key=lambda d: (device_index(d) is None, device_index(d) or -1, d))
     if chip in {"both", "all"}:
         return devs
 
-    indexed = [(d, device_index(d)) for d in devs]
-    indexed = [(d, i) for d, i in indexed if i is not None]
-    if not indexed:
-        return devs
+    selected = []
+    for d in devs:
+        i = device_index(d)
+        if i is None:
+            continue
+        if chip == "0" and 0 <= i <= 11:
+            selected.append(d)
+        elif chip == "1" and 24 <= i <= 35:
+            selected.append(d)
 
-    min_i = min(i for _, i in indexed)
-    max_i = max(i for _, i in indexed)
-    mid = (min_i + max_i + 1) // 2
+    if chip not in {"0", "1"}:
+        raise SystemExit("[ERROR] --chip must be 0, 1, or both")
 
-    if chip == "0":
-        return [d for d, i in indexed if i < mid]
-    if chip == "1":
-        return [d for d, i in indexed if i >= mid]
-    raise SystemExit("[ERROR] --chip must be 0, 1, or both")
+    return selected
 
 
 def filter_device_map(vals: Dict[str, float], chip: str) -> Dict[str, float]:
@@ -290,20 +298,42 @@ def event_map(events_df: pd.DataFrame) -> Dict[str, Dict[str, float]]:
 
 
 def metric_tool_values(metrics_df: pd.DataFrame, metric_name: str) -> Dict[str, float]:
-    dev_cols = numeric_device_cols(metrics_df)
+    """Return values for a tool-native metric alias.
+
+    Prefer per-device frontend*-value columns when present. If the metrics CSV
+    only has aggregate/average columns, fall back to the row average and expose
+    it as a synthetic "tool_average" device. This keeps the output metric name
+    unchanged while allowing dmc_fe_write_retry_util to source
+    chi_retry_percentage.
+    """
     aliases = TOOL_METRIC_ALIASES.get(metric_name, [])
     if not aliases or "metric" not in metrics_df.columns:
         return {}
+
     sub = metrics_df[metrics_df["metric"].astype(str).isin(aliases)]
     if sub.empty:
         return {}
+
     row = sub.iloc[0]
-    vals = {}
+    vals: Dict[str, float] = {}
+
+    dev_cols = numeric_device_cols(metrics_df)
     for c in dev_cols:
         v = safe_float(row.get(c))
         if v is not None:
             vals[c.replace("-value", "")] = v
-    return vals
+
+    if vals:
+        return vals
+
+    # Fallback for tool-derived rows with only summary columns.
+    for c in ("average", "Average", "avg", "AVG", "value", "Value"):
+        if c in metrics_df.columns:
+            v = safe_float(row.get(c))
+            if v is not None:
+                return {"tool_average": v}
+
+    return {}
 
 
 def divide_device_maps(num_maps: List[Dict[str, float]], den_map: Dict[str, float], scale: float) -> Dict[str, float]:
@@ -404,6 +434,17 @@ def compute_summary(events_df: pd.DataFrame, metrics_df: pd.DataFrame, chip: str
                 f["formula"],
             )
 
+    # Keep output metric name as dmc_fe_write_retry_util, but source the value
+    # from topdown's chi_retry_percentage. Do not use aggregate; use per-device
+    # frontend*-value columns and then average/min/max over the selected chip.
+    retry_vals = metric_tool_values(metrics_df, "dmc_fe_write_retry_util")
+    computed["dmc_fe_write_retry_util"] = (
+        retry_vals,
+        "%" if retry_vals else "",
+        "tool metric",
+        "chi_retry_percentage",
+    )
+
     summary_rows = []
     per_device_rows = []
     for metric in REQUESTED_METRICS:
@@ -413,6 +454,8 @@ def compute_summary(events_df: pd.DataFrame, metrics_df: pd.DataFrame, chip: str
         summary_rows.append({
             "metric": metric,
             "value": avg,
+            "min": mn,
+            "max": mx,
             "unit": unit,
         })
         for dev, v in vals.items():
@@ -448,7 +491,7 @@ def compute_summary(events_df: pd.DataFrame, metrics_df: pd.DataFrame, chip: str
                 "max": mx,
             })
 
-    return pd.DataFrame(summary_rows, columns=["metric", "value", "unit"]), pd.DataFrame(per_device_rows), pd.DataFrame(tool_rows)
+    return pd.DataFrame(summary_rows, columns=["metric", "value", "min", "max", "unit"]), pd.DataFrame(per_device_rows), pd.DataFrame(tool_rows)
 
 def write_excel(path: Path, summary: pd.DataFrame, per_device: pd.DataFrame, tool_metrics: pd.DataFrame, events_df: pd.DataFrame, metrics_df: pd.DataFrame) -> None:
     wb = Workbook()
@@ -522,7 +565,7 @@ def main() -> int:
     per_device.to_csv(per_device_csv, index=False)
 
     print(f"\n=== Summary chip={args.chip} ===")
-    cols = ["metric", "value", "unit"]
+    cols = ["metric", "value", "min", "max", "unit"]
     print(summary[cols].to_string(index=False))
     print(f"\nWrote: {xlsx}")
     print(f"Wrote: {summary_csv}")
